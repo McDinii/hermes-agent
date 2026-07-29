@@ -1137,8 +1137,31 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
+        _vocab_text: Optional[str] = None
         try:
-            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+            _vocab_path = Path.home() / ".hermes" / "state" / "stt_vocab.txt"
+            if _vocab_path.is_file():
+                _raw = _vocab_path.read_text(encoding="utf-8", errors="replace")
+                _cleaned = _raw.replace("\r", " ").replace("\n", " ").strip()
+                if _cleaned:
+                    _vocab_text = _cleaned[:900]
+        except OSError as _vocab_exc:
+            logger.debug("Failed to read STT vocab file: %s", _vocab_exc)
+
+        def _call_transcribe():
+            kwargs = dict(transcribe_kwargs)
+            if _vocab_text:
+                kwargs["hotwords"] = _vocab_text
+                try:
+                    return _local_model.transcribe(file_path, **kwargs)
+                except TypeError:
+                    kwargs.pop("hotwords", None)
+                    kwargs["initial_prompt"] = _vocab_text
+                    return _local_model.transcribe(file_path, **kwargs)
+            return _local_model.transcribe(file_path, **kwargs)
+
+        try:
+            segments, info = _call_transcribe()
             transcript = " ".join(segment.text.strip() for segment in segments)
         except Exception as exc:
             # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
@@ -1158,7 +1181,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             from faster_whisper import WhisperModel
             _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
             _local_model_name = model_name
-            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+            segments, info = _call_transcribe()
             transcript = " ".join(segment.text.strip() for segment in segments)
 
         logger.info(

@@ -1848,6 +1848,25 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
+def _event_media_is_stt_input(event, index: int) -> bool:
+    """True when the attachment at *index* should enter the automatic STT pipeline.
+
+    Single source of truth shared by ``_prepare_inbound_message_text`` and the
+    pending/queued voice paths, so "what gets transcribed while the event sits
+    in the queue" is exactly "what the inbound pipeline would transcribe".
+
+    ``MessageType.AUDIO`` (audio *file* attachments, e.g. .mp3) and
+    ``DOCUMENT`` events are never auto-transcribed; ``VOICE`` notes and other
+    events carrying an ``audio/*`` attachment are.
+    """
+    message_type = getattr(event, "message_type", None)
+    if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
+        return False
+    media_types = getattr(event, "media_types", None) or []
+    mtype = media_types[index] if index < len(media_types) else ""
+    return message_type == MessageType.VOICE or (mtype or "").startswith("audio/")
+
+
 def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
@@ -8777,7 +8796,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         already run and images are represented in-text.
         """
         history = history or []
-        message_text = event.text or ""
+        # A queued voice follow-up may already have been transcribed (and its
+        # transcript echoed) by the interrupt monitor or the pending-drain path,
+        # which cache the enriched text on the event.  Reuse it here instead of
+        # running STT — and echoing the transcript — a second time.
+        _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
+        message_text = (
+            getattr(event, "_gateway_pending_stt_text", None)
+            if _pending_stt_prepared
+            else event.text
+        ) or ""
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Use the same helper every other call site uses so the write key here
@@ -8818,11 +8846,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # MessageType.VOICE = voice message (Opus/OGG) — always STT
                 if event.message_type == MessageType.AUDIO:
                     audio_file_paths.append(path)
-                elif event.message_type == MessageType.VOICE or (
-                    mtype.startswith("audio/")
-                    and event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
-                ):
-                    audio_paths.append(path)
+                elif _event_media_is_stt_input(event, i):
+                    # Already transcribed while queued: the transcript is in
+                    # message_text (see _pending_stt_prepared above).
+                    if not _pending_stt_prepared:
+                        audio_paths.append(path)
                 if mtype.startswith("video/") or event.message_type == MessageType.VIDEO:
                     video_paths.append(path)
 
@@ -13166,14 +13194,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from tools.transcription_tools import transcribe_audio
 
+        memo = self._stt_transcript_memo()
         enriched_parts = []
         successful_transcripts: List[str] = []
         for path in audio_paths:
             try:
-                logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                memo_key = os.path.abspath(path)
+                if memo_key in memo:
+                    # Same cached audio file seen again in this process (e.g.
+                    # a queued voice note re-enriched after a media merge).
+                    # Inbound audio paths are uuid-named, so a hit can only
+                    # be the very same platform message — never re-run STT.
+                    memo.move_to_end(memo_key)
+                    logger.debug("Reusing cached transcript for %s", path)
+                    result = {"success": True, "transcript": memo[memo_key]}
+                else:
+                    logger.debug("Transcribing user voice: %s", path)
+                    result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    memo[memo_key] = transcript
+                    while len(memo) > self._STT_TRANSCRIPT_MEMO_MAX:
+                        memo.popitem(last=False)
                     successful_transcripts.append(transcript)
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
@@ -13222,6 +13264,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"{prefix}\n\n{user_text}", successful_transcripts
             return prefix, successful_transcripts
         return user_text, successful_transcripts
+
+    # Bounded size of the per-runner "audio path -> transcript" memo used by
+    # _enrich_message_with_transcription.  Local whisper on a laptop costs
+    # ~30s of CPU per voice note, so never pay it twice for the same file.
+    _STT_TRANSCRIPT_MEMO_MAX = 50
+
+    def _stt_transcript_memo(self) -> "OrderedDict[str, str]":
+        """Return the lazily created, insertion-ordered transcript memo."""
+        memo = getattr(self, "_stt_transcript_memo_store", None)
+        if memo is None:
+            memo = OrderedDict()
+            self._stt_transcript_memo_store = memo
+        return memo
+
+    def _pending_event_audio_paths(self, event) -> List[str]:
+        """Return STT-eligible attachment paths from a pending/queued event."""
+        media_urls = getattr(event, "media_urls", None) or []
+        return [
+            path
+            for i, path in enumerate(media_urls)
+            if _event_media_is_stt_input(event, i)
+        ]
+
+    async def _transcribe_pending_audio_event_once(
+        self,
+        event,
+        user_text: Optional[str] = None,
+    ) -> tuple[str | None, List[str]]:
+        """Transcribe a pending audio event once and cache the result on the event.
+
+        A queued voice follow-up is touched by up to three consumers: the
+        interrupt monitor (peek), the post-run pending drain, and finally
+        ``_prepare_inbound_message_text`` when the event becomes the next
+        user turn.  All of them need the same transcript, but exactly one STT
+        call (and one transcript echo) may happen per platform message.  The
+        enriched text and raw transcripts are cached on the event via
+        ``_gateway_pending_stt_text`` / ``_gateway_pending_stt_transcripts``;
+        ``merge_pending_message_event`` drops that cache when new media is
+        merged into the event so the merged note gets transcribed too.
+        """
+        if hasattr(event, "_gateway_pending_stt_text"):
+            cached_text = getattr(event, "_gateway_pending_stt_text")
+            cached_transcripts = getattr(event, "_gateway_pending_stt_transcripts", []) or []
+            return cached_text, list(cached_transcripts)
+
+        audio_paths = self._pending_event_audio_paths(event)
+        if not audio_paths:
+            return user_text if user_text is not None else (getattr(event, "text", None) or None), []
+
+        text = user_text if user_text is not None else (getattr(event, "text", "") or "")
+        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+            text,
+            audio_paths,
+        )
+        setattr(event, "_gateway_pending_stt_text", enriched_text)
+        setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
+        return enriched_text, successful_transcripts
+
+    async def _echo_pending_stt_transcripts_once(
+        self,
+        event,
+        adapter,
+        source,
+        transcripts: List[str],
+        *,
+        metadata=None,
+        log_context: str = "Transcript",
+    ) -> None:
+        """Echo pending-event STT transcripts to the chat at most once.
+
+        The already-echoed transcripts are tracked as a COUNT rather than a
+        single boolean.  ``merge_pending_message_event`` can append a second
+        voice note to an event whose first transcript was already echoed and
+        invalidates the transcription cache; the re-run transcription then
+        returns the earlier transcripts as a prefix of the new list, so
+        echoing only the unsent tail suppresses the repeat while still
+        surfacing the newly merged note.  A count rather than a set of seen
+        values because two separate notes that transcribe identically are two
+        distinct deliveries and both must be echoed.
+        """
+        if not transcripts or adapter is None:
+            return
+        already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
+        unsent = transcripts[already_echoed:]
+        setattr(event, "_gateway_pending_stt_echoed", already_echoed + len(unsent))
+        for tx in unsent:
+            try:
+                await adapter.send(
+                    source.chat_id,
+                    f'🎙️ "{tx}"',
+                    metadata=metadata,
+                )
+            except Exception as echo_exc:
+                logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
+
+    async def _transcribe_and_echo_pending_voice(
+        self,
+        event,
+        adapter,
+        source,
+        text: str,
+        *,
+        log_context: str,
+        metadata=None,
+    ) -> tuple[str, List[str]]:
+        """Transcribe a pending voice event and echo transcripts once.
+
+        Unified helper for the interrupt-monitor (peek) and pending-drain
+        paths.  Returns ``(enriched_text, transcripts)`` so the caller can feed
+        the enriched text into ``agent.interrupt()`` or the drain flow.
+
+        If the event has no STT-eligible media, returns ``(text, [])``
+        unchanged.  The caller is responsible for the
+        ``_build_media_placeholder`` fallback when ``text`` is empty and the
+        event has non-audio media.
+        """
+        if not self._pending_event_audio_paths(event):
+            return text, []
+        try:
+            enriched_text, transcripts = await self._transcribe_pending_audio_event_once(
+                event,
+                text,
+            )
+            await self._echo_pending_stt_transcripts_once(
+                event,
+                adapter,
+                source,
+                transcripts,
+                metadata=metadata,
+                log_context=log_context,
+            )
+            return enriched_text or text, transcripts
+        except Exception as trans_exc:
+            logger.warning("%s transcription failed: %s", log_context, trans_exc)
+            return text, []
 
     async def _dequeue_pending_with_transcription(
         self,
@@ -16603,43 +16780,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # real transcript instead of an empty string
                                 # (or file-path placeholder). Matches the UX
                                 # of fresh voice messages including the
-                                # 🎙️ echo back to the user.
-                                _media_urls = getattr(_peek_event, "media_urls", None) or []
-                                _media_types = getattr(_peek_event, "media_types", None) or []
-                                _audio_paths = []
-                                for _i, _path in enumerate(_media_urls):
-                                    _mtype = _media_types[_i] if _i < len(_media_types) else ""
-                                    _is_audio = (
-                                        _mtype.startswith("audio/")
-                                        or getattr(_peek_event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
-                                    )
-                                    if _is_audio:
-                                        _audio_paths.append(_path)
-                                if _audio_paths:
-                                    try:
-                                        _enriched, _transcripts = await self._enrich_message_with_transcription(
-                                            pending_text, _audio_paths,
-                                        )
-                                        pending_text = _enriched
-                                        if _transcripts:
-                                            _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                                            for _tx in _transcripts:
-                                                try:
-                                                    await _adapter.send(
-                                                        source.chat_id,
-                                                        f'🎙️ "{_tx}"',
-                                                        metadata=_echo_meta,
-                                                    )
-                                                except Exception as _echo_exc:
-                                                    logger.debug(
-                                                        "Voice-interrupt echo failed (non-fatal): %s",
-                                                        _echo_exc,
-                                                    )
-                                    except Exception as _trans_exc:
-                                        logger.warning(
-                                            "Voice-interrupt transcription failed: %s", _trans_exc,
-                                        )
-                                elif not pending_text and _media_urls:
+                                # 🎙️ echo back to the user.  The transcript is
+                                # cached ON the event, so the post-run drain
+                                # and _prepare_inbound_message_text reuse it
+                                # instead of running STT (and echoing) again.
+                                _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                                pending_text, _ = await self._transcribe_and_echo_pending_voice(
+                                    _peek_event,
+                                    _adapter,
+                                    source,
+                                    pending_text,
+                                    log_context="Voice-interrupt",
+                                    metadata=_echo_meta,
+                                )
+                                if not pending_text and (getattr(_peek_event, "media_urls", None) or []):
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
                             agent.interrupt(pending_text)
@@ -16982,47 +17136,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Transcribe audio media on the dequeued event BEFORE it is
                     # handed back as the next user turn, so queued/interrupting
                     # voice messages drain with the real transcript instead of
-                    # a file-path placeholder. Echo each transcript back to the
-                    # user (same 🎙️ format as fresh voice messages) so voice
-                    # interrupts feel identical to text interrupts.
+                    # a file-path placeholder, and echo each transcript back to
+                    # the user (same 🎙️ format as fresh voice messages).  The
+                    # result is cached on the event: if the interrupt monitor
+                    # already transcribed (and echoed) it nothing runs twice,
+                    # and _prepare_inbound_message_text below reuses the same
+                    # cached transcript instead of calling STT a second time.
                     _pending_text = pending_event.text or ""
-                    _media_urls = getattr(pending_event, "media_urls", None) or []
-                    _media_types = getattr(pending_event, "media_types", None) or []
-                    _audio_paths = []
-                    for _i, _path in enumerate(_media_urls):
-                        _mtype = _media_types[_i] if _i < len(_media_types) else ""
-                        _is_audio = (
-                            _mtype.startswith("audio/")
-                            or getattr(pending_event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
-                        )
-                        if _is_audio:
-                            _audio_paths.append(_path)
-                    if _audio_paths:
-                        try:
-                            _enriched, _transcripts = await self._enrich_message_with_transcription(
-                                _pending_text, _audio_paths,
-                            )
-                            pending = _enriched or None
-                            if _transcripts:
-                                _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                                for _tx in _transcripts:
-                                    try:
-                                        await adapter.send(
-                                            source.chat_id,
-                                            f'🎙️ "{_tx}"',
-                                            metadata=_echo_meta,
-                                        )
-                                    except Exception as _echo_exc:
-                                        logger.debug(
-                                            "Voice-drain echo failed (non-fatal): %s", _echo_exc,
-                                        )
-                        except Exception as _trans_exc:
-                            logger.warning(
-                                "Voice-drain transcription failed: %s", _trans_exc,
-                            )
-                            pending = _pending_text or _build_media_placeholder(pending_event)
-                    else:
-                        pending = _pending_text or _build_media_placeholder(pending_event)
+                    _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    _pending_text, _ = await self._transcribe_and_echo_pending_voice(
+                        pending_event,
+                        adapter,
+                        source,
+                        _pending_text,
+                        log_context="Voice-drain",
+                        metadata=_echo_meta,
+                    )
+                    pending = _pending_text or _build_media_placeholder(pending_event)
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 

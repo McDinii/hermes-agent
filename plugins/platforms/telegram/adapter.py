@@ -15,6 +15,7 @@ import logging
 import os
 import tempfile
 import html as _html
+import random
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -90,6 +91,10 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+
+# Final reactions set by on_processing_complete.
+_SUCCESS_REACTIONS = ("\U0001f525", "✅", "\U0001f44c", "\U0001f3af", "⚡")  # 🔥 ✅ 👌 🎯 ⚡
+_FAILURE_REACTION = "\U0001f921"  # 🤡
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -7237,8 +7242,11 @@ class TelegramAdapter(BasePlatformAdapter):
         interrupted mid-flight), we explicitly clear the 👀 in-progress
         reaction so it doesn't linger on the user's message indefinitely.
         Without this clear, the only way to remove the 👀 was to wait for
-        another agent run to swap it to 👍/👎 — which never happens if the
-        cancellation was the last activity in the chat.
+        another agent run to swap it to a final reaction — which never happens
+        if the cancellation was the last activity in the chat.
+
+        SUCCESS picks a random emoji from ``_SUCCESS_REACTIONS`` (falling back
+        to 👍 if Telegram rejects it); FAILURE sets ``_FAILURE_REACTION``.
         """
         if not self._reactions_enabled():
             return
@@ -7248,12 +7256,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
+        elif outcome == ProcessingOutcome.SUCCESS:
+            emoji = random.choice(_SUCCESS_REACTIONS)
+            if not await self._set_reaction(chat_id, message_id, emoji) and emoji != "\U0001f44d":
+                # Some emoji may be outside Telegram's allowed reaction set
+                # for this chat; fall back so 👀 doesn't linger.
+                await self._set_reaction(chat_id, message_id, "\U0001f44d")
         else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
-            )
+            await self._set_reaction(chat_id, message_id, _FAILURE_REACTION)
 
 
 # ──────────────────────────────────────────────────────────────────────────

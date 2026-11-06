@@ -173,25 +173,55 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 # ── on_processing_complete ───────────────────────────────────────────
 
 
+SUCCESS_SET = {"\U0001f525", "✅", "\U0001f44c", "\U0001f3af", "⚡"}  # 🔥 ✅ 👌 🎯 ⚡
+
+
 @pytest.mark.asyncio
-async def test_on_processing_complete_success(monkeypatch):
-    """Successful processing should set thumbs-up reaction."""
+@pytest.mark.parametrize("_run", range(20))
+async def test_on_processing_complete_success(monkeypatch, _run):
+    """Successful processing should set one emoji from the success set."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    adapter._bot.set_message_reaction.assert_awaited_once_with(
-        chat_id=123,
-        message_id=456,
-        reaction="\U0001f44d",
+    adapter._bot.set_message_reaction.assert_awaited_once()
+    kwargs = adapter._bot.set_message_reaction.await_args.kwargs
+    assert kwargs["chat_id"] == 123
+    assert kwargs["message_id"] == 456
+    assert kwargs["reaction"] in SUCCESS_SET
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_success_set_matches_spec():
+    """The adapter's success set is exactly the agreed one."""
+    from plugins.platforms.telegram.adapter import _SUCCESS_REACTIONS
+
+    assert set(_SUCCESS_REACTIONS) == SUCCESS_SET
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_success_falls_back_to_thumbs_up(monkeypatch):
+    """If Telegram rejects the chosen emoji, fall back to 👍 so 👀 doesn't linger."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    adapter._bot.set_message_reaction = AsyncMock(
+        side_effect=[RuntimeError("REACTION_INVALID"), None]
     )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.random.choice", lambda seq: "\U0001f3af"
+    )
+
+    await adapter.on_processing_complete(_make_event(), ProcessingOutcome.SUCCESS)
+
+    reactions = [c.kwargs["reaction"] for c in adapter._bot.set_message_reaction.await_args_list]
+    assert reactions == ["\U0001f3af", "\U0001f44d"]
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_failure(monkeypatch):
-    """Failed processing should set thumbs-down reaction."""
+    """Failed processing should set the clown reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -201,7 +231,7 @@ async def test_on_processing_complete_failure(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f44e",
+        reaction="\U0001f921",
     )
 
 

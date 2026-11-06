@@ -7206,6 +7206,18 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, e)
             return False
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Public reaction hook used by ``send_message`` action=react."""
+        return await self._set_reaction(chat_id, message_id, emoji)
+
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str = "") -> bool:
+        """Public hook for action=react with remove=True.
+
+        Telegram can only clear all bot-set reactions at once, so ``emoji``
+        is accepted for interface compatibility and ignored.
+        """
+        return await self._clear_reactions(chat_id, message_id)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():

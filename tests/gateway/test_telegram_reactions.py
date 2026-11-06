@@ -274,6 +274,40 @@ async def test_clear_reactions_returns_false_without_bot(monkeypatch):
     assert result is False
 
 
+# ── add_reaction / remove_reaction (send_message action=react) ───────
+
+
+@pytest.mark.asyncio
+async def test_add_reaction_sets_given_emoji():
+    """add_reaction should set exactly the emoji passed by the caller."""
+    adapter = _make_adapter()
+
+    # Same keyword call shape as tools/send_message_tool.py _handle_react.
+    result = await adapter.add_reaction(chat_id="123", emoji="\U0001f525", message_id="456")
+
+    assert result is True
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f525",
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_reaction_clears_reactions():
+    """remove_reaction should clear reactions via reaction=None."""
+    adapter = _make_adapter()
+
+    result = await adapter.remove_reaction(chat_id="123", message_id="456")
+
+    assert result is True
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
+
+
 # ── config.py bridging ───────────────────────────────────────────────
 
 

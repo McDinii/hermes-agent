@@ -2210,6 +2210,157 @@ def _apply_subagent_artifacts(
             entry["summary"] = written["receipt"]
 
 
+# --- Child -> parent progress channel ---------------------------------------
+# Non-blocking, fire-and-forget (pi-subagents' intercom ``progress_update``):
+# the child drops one JSON file per update under
+# subagent_runs/<runId>/requests/, the parent reads them once the run ends.
+# runId/taskIndex live on the child AIAgent itself (no globals), so parallel
+# children of one batch never mix up their updates.
+
+PROGRESS_UPDATE_TOOL_NAME = "progress_update"
+
+PROGRESS_UPDATE_SCHEMA = {
+    "name": PROGRESS_UPDATE_TOOL_NAME,
+    "description": (
+        "Send a short progress note to the parent agent that delegated this "
+        "task. Non-blocking: it does not wait for a reply, just records the "
+        "message so the parent sees it with your final result. Use it for "
+        "milestones or notable findings, not for every step."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "Progress note for the parent (one or two sentences).",
+            },
+        },
+        "required": ["message"],
+    },
+}
+
+
+def _progress_requests_dir(run_id: str):
+    return _subagent_runs_dir() / run_id / "requests"
+
+
+def _write_progress_update(run_id: str, task_index: int, message: str) -> str:
+    """Atomically write one progress request file; returns its path."""
+    import tempfile
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    req_dir = _progress_requests_dir(run_id)
+    req_dir.mkdir(parents=True, exist_ok=True)
+    for d in (req_dir, req_dir.parent):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    req_id = _uuid.uuid4().hex
+    payload = {
+        "type": "subagent.progress",
+        "id": req_id,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "runId": run_id,
+        "taskIndex": task_index,
+        "message": message,
+    }
+    final_path = req_dir / f"{req_id}.json"
+    fd, tmp_path = tempfile.mkstemp(dir=str(req_dir), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp_path, final_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return str(final_path)
+
+
+def progress_update_tool(agent, message: Any) -> str:
+    """Handler for the child's ``progress_update`` tool.
+
+    Never raises: a failed write comes back to the child as a tool error so
+    it can carry on with its task.
+    """
+    run_id = getattr(agent, "_subagent_run_id", None)
+    task_index = getattr(agent, "_subagent_task_index", None)
+    if not run_id or not isinstance(task_index, int):
+        return tool_error("progress_update is only available inside a delegated subagent.")
+    if not isinstance(message, str) or not message.strip():
+        return tool_error("progress_update requires a non-empty 'message'.")
+    try:
+        _write_progress_update(run_id, task_index, message.strip())
+    except Exception as exc:
+        logger.warning(
+            "progress_update write failed for run %s task %s", run_id, task_index,
+            exc_info=True,
+        )
+        return tool_error(f"Failed to record progress update: {exc}")
+    return json.dumps({"success": True, "status": "recorded"})
+
+
+def _attach_progress_channel(child, run_id: str, task_index: int) -> None:
+    """Give a freshly built child its run identity and the progress tool."""
+    child._subagent_run_id = run_id
+    child._subagent_task_index = task_index
+    tools = getattr(child, "tools", None)
+    if not isinstance(tools, list):
+        tools = []
+        child.tools = tools
+    names = getattr(child, "valid_tool_names", None)
+    if not isinstance(names, set):
+        names = set(names or ())
+        child.valid_tool_names = names
+    if PROGRESS_UPDATE_TOOL_NAME not in names:
+        tools.append({"type": "function", "function": dict(PROGRESS_UPDATE_SCHEMA)})
+        names.add(PROGRESS_UPDATE_TOOL_NAME)
+
+
+def _read_progress_updates(run_id: str) -> List[Dict[str, Any]]:
+    """All progress requests of a run, oldest first; unreadable files skipped."""
+    req_dir = _progress_requests_dir(run_id)
+    if not req_dir.is_dir():
+        return []
+    updates = []
+    for path in req_dir.glob("*.json"):
+        if path.name.startswith(".tmp-"):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("Skipping unreadable progress request %s", path, exc_info=True)
+            continue
+        if isinstance(data, dict) and data.get("type") == "subagent.progress":
+            updates.append(data)
+    updates.sort(key=lambda d: (str(d.get("createdAt", "")), str(d.get("id", ""))))
+    return updates
+
+
+def _apply_progress_updates(run_id: str, results: List[Dict[str, Any]]) -> None:
+    """Append a 'Progress updates:' section to each task that sent any."""
+    updates = _read_progress_updates(run_id)
+    if not updates:
+        return
+    by_task: Dict[int, List[str]] = {}
+    for upd in updates:
+        idx = upd.get("taskIndex")
+        msg = upd.get("message")
+        if isinstance(idx, int) and isinstance(msg, str) and msg:
+            by_task.setdefault(idx, []).append(msg)
+    for entry in results:
+        msgs = by_task.get(entry.get("task_index"))
+        if not msgs:
+            continue
+        section = "Progress updates:\n" + "\n".join(f"- {m}" for m in msgs)
+        base = entry.get("summary") or ""
+        entry["summary"] = f"{base}\n\n{section}" if base else section
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2389,6 +2540,7 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
+            _attach_progress_channel(child, run_id, i)
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
@@ -2628,6 +2780,7 @@ def delegate_task(
         # Memory + subagent_stop hooks above saw the full report; from here on
         # the parent context only gets a receipt pointing at the artifact.
         _apply_subagent_artifacts(run_id, results, run_started_at, children)
+        _apply_progress_updates(run_id, results)
 
         total_duration = round(time.monotonic() - overall_start, 2)
 

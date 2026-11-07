@@ -49,7 +49,8 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task",
+     "progress_update"}
 )
 
 
@@ -1879,6 +1880,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+    elif function_name == "progress_update":
+        def _execute(next_args: dict) -> Any:
+            from tools.delegate_tool import progress_update_tool as _progress_update_tool
+            return _finish_agent_tool(
+                _progress_update_tool(agent, next_args.get("message")),
+                next_args,
+            )
     else:
         def _execute(next_args: dict) -> Any:
             return _ra().handle_function_call(

@@ -2081,6 +2081,135 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+_ARTIFACT_SUMMARY_CHARS = 200
+
+
+def _new_subagent_run_id() -> str:
+    """One id per delegate_task call, shared by every task in the batch."""
+    import uuid as _uuid
+
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{_uuid.uuid4().hex[:8]}"
+
+
+def _subagent_runs_dir():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / "subagent_runs"
+
+
+def _child_session_path(child) -> Optional[str]:
+    """Absolute path of the child's session JSON log, if one was written."""
+    try:
+        logs_dir = getattr(child, "logs_dir", None)
+        session_id = getattr(child, "session_id", None)
+        if not logs_dir or not isinstance(session_id, str) or not session_id:
+            return None
+        from pathlib import Path
+
+        path = Path(logs_dir) / f"session_{session_id}.json"
+        return str(path.resolve()) if path.is_file() else None
+    except Exception:
+        return None
+
+
+def _short_summary(text: str, max_lines: int = 2) -> str:
+    """First 1-2 non-empty lines of the report, capped at the meta length."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    short = " ".join(lines[:max_lines])
+    if len(short) > _ARTIFACT_SUMMARY_CHARS:
+        short = short[: _ARTIFACT_SUMMARY_CHARS - 1].rstrip() + "…"
+    return short
+
+
+def _write_subagent_artifacts(
+    run_id: str,
+    entry: Dict[str, Any],
+    started_at: float,
+    child=None,
+) -> Optional[Dict[str, Any]]:
+    """Persist a subagent's full report + meta to $HERMES_HOME/state/subagent_runs.
+
+    Mirrors pi-subagents' artifacts: the parent context gets a short receipt
+    pointing at the file instead of the whole report.  Returns
+    ``{"output_path", "meta_path", "receipt"}`` or None when nothing could be
+    written (caller keeps the full text in that case).
+    """
+    task_index = entry.get("task_index", 0)
+    report = entry.get("summary") or entry.get("error") or ""
+    from datetime import datetime, timezone
+
+    duration = entry.get("duration_seconds") or 0
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+    finished_at = started_at + duration
+    try:
+        runs_dir = _subagent_runs_dir()
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        base = f"{run_id}_task{task_index}"
+        output_path = (runs_dir / f"{base}_output.md").resolve()
+        meta_path = (runs_dir / f"{base}_meta.json").resolve()
+
+        output_path.write_text(report, encoding="utf-8")
+        meta = {
+            "run_id": run_id,
+            "task_index": task_index,
+            "status": entry.get("status"),
+            "summary": report[:_ARTIFACT_SUMMARY_CHARS],
+            "artifactPath": str(output_path),
+            "sessionPath": _child_session_path(child),
+            "started_at": datetime.fromtimestamp(started_at, timezone.utc).isoformat(),
+            "finished_at": datetime.fromtimestamp(finished_at, timezone.utc).isoformat(),
+            "duration_s": duration,
+        }
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write subagent artifacts for run %s task %s; "
+            "returning full report inline",
+            run_id, task_index, exc_info=True,
+        )
+        return None
+
+    size_kb = len(report.encode("utf-8")) / 1024
+    n_lines = len(report.splitlines())
+    receipt = f"Output saved to: {output_path} ({size_kb:.1f} KB, {n_lines} lines)"
+    short = _short_summary(report)
+    if short:
+        receipt += f"\n{short}"
+    return {
+        "output_path": str(output_path),
+        "meta_path": str(meta_path),
+        "receipt": receipt,
+    }
+
+
+def _apply_subagent_artifacts(
+    run_id: str,
+    results: List[Dict[str, Any]],
+    started_at: float,
+    children: list,
+) -> None:
+    """Swap each completed report for an artifact receipt, in place."""
+    for entry in results:
+        idx = entry.get("task_index", -1)
+        child = (
+            children[idx][2]
+            if isinstance(idx, int) and 0 <= idx < len(children)
+            else None
+        )
+        written = _write_subagent_artifacts(run_id, entry, started_at, child)
+        if not written:
+            continue
+        entry["artifact_path"] = written["output_path"]
+        entry["meta_path"] = written["meta_path"]
+        if entry.get("summary"):
+            entry["summary"] = written["receipt"]
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2211,6 +2340,8 @@ def delegate_task(
 
     overall_start = time.monotonic()
     results = []
+    # Shared by every task of this call so a batch's artifacts sort together.
+    run_id = _new_subagent_run_id()
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -2273,6 +2404,9 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        # Wall-clock start for artifact meta; taken here rather than at call
+        # time because the background path runs this later on the executor.
+        run_started_at = time.time()
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
@@ -2490,6 +2624,10 @@ def delegate_task(
                     parent_agent.session_cost_status = "estimated"
             except Exception:
                 logger.debug("Subagent cost rollup failed", exc_info=True)
+
+        # Memory + subagent_stop hooks above saw the full report; from here on
+        # the parent context only gets a receipt pointing at the artifact.
+        _apply_subagent_artifacts(run_id, results, run_started_at, children)
 
         total_duration = round(time.monotonic() - overall_start, 2)
 

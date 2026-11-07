@@ -58,6 +58,14 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+def _assert_receipt(tc, entry, report):
+    """delegate_task returns an artifact receipt; the full report is on disk."""
+    tc.assertTrue(entry["summary"].startswith("Output saved to: "), entry["summary"])
+    tc.assertEqual(entry["summary"].splitlines()[-1], report)
+    with open(entry["artifact_path"], encoding="utf-8") as fh:
+        tc.assertEqual(fh.read(), report)
+
+
 class TestDelegateRequirements(unittest.TestCase):
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
@@ -226,7 +234,7 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("results", result)
         self.assertEqual(len(result["results"]), 1)
         self.assertEqual(result["results"][0]["status"], "completed")
-        self.assertEqual(result["results"][0]["summary"], "Done!")
+        _assert_receipt(self, result["results"][0], "Done!")
         mock_run.assert_called_once()
 
     @patch("tools.delegate_tool._run_single_child")
@@ -243,8 +251,8 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
         self.assertIn("results", result)
         self.assertEqual(len(result["results"]), 2)
-        self.assertEqual(result["results"][0]["summary"], "Result A")
-        self.assertEqual(result["results"][1]["summary"], "Result B")
+        _assert_receipt(self, result["results"][0], "Result A")
+        _assert_receipt(self, result["results"][1], "Result B")
         self.assertIn("total_duration_seconds", result)
 
     @patch("tools.delegate_tool._run_single_child")
@@ -277,8 +285,8 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIn("results", result)
         self.assertEqual(len(result["results"]), 2)
-        self.assertEqual(result["results"][0]["summary"], "Result A")
-        self.assertEqual(result["results"][1]["summary"], "Result B")
+        _assert_receipt(self, result["results"][0], "Result A")
+        _assert_receipt(self, result["results"][1], "Result B")
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_rejects_non_object_tasks(self, mock_run):
@@ -1923,11 +1931,19 @@ class TestDelegateHeartbeat(unittest.TestCase):
             "last_activity_desc": "executing tool: terminal",
         }
 
+        # Idle rules would stop the heartbeat after 2 touches; require
+        # comfortably more than that.  A fixed sleep(0.4) was flaky under
+        # load (scheduler delays starved the 0.05s loop), so instead the
+        # "tool" runs until the target is reached or a generous deadline
+        # passes.  Idle-threshold behaviour can never reach the target, so
+        # it still fails — just after the deadline instead of by luck.
+        target_touches = 6
+        deadline_s = 5.0
+
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            deadline = time.monotonic() + deadline_s
+            while len(touch_calls) < target_touches and time.monotonic() < deadline:
+                time.sleep(0.02)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
@@ -1948,11 +1964,11 @@ class TestDelegateHeartbeat(unittest.TestCase):
             )
 
         # If idle-threshold logic applied, we'd cap around 2 touches; prove we
-        # continued beyond that while inside a long-running tool.
-        self.assertGreater(
-            len(touch_calls), 2,
+        # continued well beyond that while inside a long-running tool.
+        self.assertGreaterEqual(
+            len(touch_calls), target_touches,
             f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+            f"got {len(touch_calls)} touches within {deadline_s}s at 0.05s interval",
         )
 
 

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import html as _html
 import random
 import re
@@ -85,6 +86,7 @@ from gateway.platforms.base import (
     _TEXT_INJECT_EXTENSIONS,
     utf16_len,
 )
+from gateway.platforms.helpers import MessageDeduplicator
 from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
@@ -610,6 +612,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # (chat_id, text) -> (monotonic ts, message_id) of recently delivered
+        # texts, used by send() to drop exact repeats within 60s.
+        self._recent_sent_texts: Dict[tuple, tuple] = {}
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -2604,7 +2609,86 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    # Identical text delivered to the same chat within this window is not sent
+    # again. Last line of defence against duplicate final replies: a streamed
+    # preview followed by a normal final send (provider fallback, broken
+    # stream, queued follow-up), or the same inbound handled twice.
+    _RECENT_TEXT_DEDUP_WINDOW_S = 60.0
+
+    def _recent_text_key(self, content: str) -> Optional[str]:
+        text = (content or "").strip()
+        return text or None
+
+    def _find_recent_text(self, chat_id: str, content: str) -> Optional[str]:
+        """Return the message id of an identical text sent to chat_id recently.
+
+        Returns "" when a match exists but its message id is unknown, None when
+        there is no match.
+        """
+        key = self._recent_text_key(content)
+        if key is None:
+            return None
+        # getattr() — tests build adapters via object.__new__() (no __init__).
+        recent = getattr(self, "_recent_sent_texts", None)
+        if not recent:
+            return None
+        now = time.monotonic()
+        window = self._RECENT_TEXT_DEDUP_WINDOW_S
+        for k in [k for k, (ts, _) in recent.items() if now - ts > window]:
+            recent.pop(k, None)
+        hit = recent.get((str(chat_id), key))
+        if hit is None:
+            return None
+        return hit[1] or ""
+
+    def _remember_sent_text(self, chat_id: str, content: str, message_id: Optional[str]) -> None:
+        key = self._recent_text_key(content)
+        if key is None:
+            return
+        recent = getattr(self, "_recent_sent_texts", None)
+        if recent is None:
+            recent = {}
+            self._recent_sent_texts = recent
+        recent[(str(chat_id), key)] = (time.monotonic(), str(message_id) if message_id else "")
+
     async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> SendResult:
+        """Send a message to a Telegram chat, skipping exact repeats.
+
+        If the same text already reached this chat (sent or finalized via
+        edit) within ``_RECENT_TEXT_DEDUP_WINDOW_S`` seconds, nothing is sent
+        and the earlier message id is returned as a success.
+
+        Streaming previews (``expect_edits`` without ``notify``) bypass the
+        check: the consumer keeps editing the returned message id, so handing
+        back an older message would overwrite a previous reply. Their final
+        text is remembered by the finalize ``edit_message`` instead.
+        """
+        meta = metadata or {}
+        if meta.get("expect_edits") and not meta.get("notify"):
+            return await self._send_uncached(chat_id, content, reply_to=reply_to, metadata=metadata)
+        previous_id = self._find_recent_text(chat_id, content)
+        if previous_id is not None:
+            logger.info(
+                "[%s] Suppressing duplicate send to chat %s: identical text already delivered within %ds (message %s).",
+                self.name, chat_id, int(self._RECENT_TEXT_DEDUP_WINDOW_S), previous_id or "?",
+            )
+            return SendResult(
+                success=True,
+                message_id=previous_id or None,
+                raw_response={"deduplicated": True},
+            )
+        result = await self._send_uncached(chat_id, content, reply_to=reply_to, metadata=metadata)
+        if result.success and result.message_id:
+            self._remember_sent_text(chat_id, content, result.message_id)
+        return result
+
+    async def _send_uncached(
         self,
         chat_id: str,
         content: str,
@@ -2958,6 +3042,27 @@ class TelegramAdapter(BasePlatformAdapter):
         return result
 
     async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit a previously sent Telegram message.
+
+        A successful finalize edit (the end of a streamed reply) is remembered
+        so a later ``send()`` of the same text to this chat is skipped.
+        """
+        result = await self._edit_message_uncached(
+            chat_id, message_id, content, finalize=finalize, metadata=metadata,
+        )
+        if finalize and result.success:
+            self._remember_sent_text(chat_id, content, result.message_id or message_id)
+        return result
+
+    async def _edit_message_uncached(
         self,
         chat_id: str,
         message_id: str,
@@ -6254,6 +6359,25 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _is_duplicate_update(self, update: Update) -> bool:
+        """Return True if this Telegram update_id was already handled.
+
+        Polling reconnects can redeliver an update whose offset was never
+        acknowledged; processing it again makes the bot answer twice.
+        """
+        update_id = getattr(update, "update_id", None)
+        if not isinstance(update_id, int):
+            return False
+        # getattr() — tests build adapters via object.__new__() (no __init__).
+        dedup = getattr(self, "_update_dedup", None)
+        if dedup is None:
+            dedup = MessageDeduplicator()
+            self._update_dedup = dedup
+        if dedup.is_duplicate(str(update_id)):
+            logger.info("[%s] Ignoring redelivered Telegram update %s", self.name, update_id)
+            return True
+        return False
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -6263,6 +6387,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if self._is_duplicate_update(update):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
@@ -6280,6 +6406,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if self._is_duplicate_update(update):
             return
         if not self._should_process_message(msg, is_command=True):
             return
@@ -6477,6 +6605,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if self._is_duplicate_update(update):
             return
         if not self._should_process_message(update.message):
             if self._should_observe_unmentioned_group_message(update.message):
